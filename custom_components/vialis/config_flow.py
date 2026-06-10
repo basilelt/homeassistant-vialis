@@ -10,6 +10,7 @@ import aiohttp
 import voluptuous as vol
 
 from homeassistant import config_entries
+from homeassistant.core import callback
 from homeassistant.helpers import selector
 
 from .const import (
@@ -17,8 +18,12 @@ from .const import (
     CLIENT_ID,
     CODE_VERIFIER,
     CONF_PASSWORD,
+    CONF_UPDATE_HOURS,
     CONF_USERNAME,
+    DEFAULT_UPDATE_HOURS,
     DOMAIN,
+    MAX_UPDATE_HOURS,
+    MIN_UPDATE_HOURS,
     REDIRECT_URI,
 )
 
@@ -101,6 +106,12 @@ class VialisConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
 
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: config_entries.ConfigEntry) -> config_entries.OptionsFlow:
+        """Return the options flow handler."""
+        return VialisOptionsFlow()
+
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
@@ -126,3 +137,32 @@ class VialisConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             data_schema=_STEP_USER_DATA_SCHEMA,
             errors=errors,
         )
+
+
+class VialisOptionsFlow(config_entries.OptionsFlow):
+    """Handle options for Vialis Linky (poll interval)."""
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
+        """Show/handle the options form."""
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        current_hours = self.config_entry.options.get(CONF_UPDATE_HOURS, DEFAULT_UPDATE_HOURS)
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_UPDATE_HOURS, default=int(current_hours)): selector.selector(
+                    {
+                        "number": {
+                            "min": MIN_UPDATE_HOURS,
+                            "max": MAX_UPDATE_HOURS,
+                            "step": 1,
+                            "unit_of_measurement": "h",
+                            "mode": "box",
+                        }
+                    }
+                ),
+            }
+        )
+        return self.async_show_form(step_id="init", data_schema=schema)

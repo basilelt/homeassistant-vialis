@@ -12,7 +12,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .const import (
     DOMAIN, BASE_URL, CLIENT_ID, REDIRECT_URI, CODE_VERIFIER,
-    UPDATE_INTERVAL, CONF_USERNAME, CONF_PASSWORD,
+    CONF_UPDATE_HOURS, DEFAULT_UPDATE_HOURS, CONF_USERNAME, CONF_PASSWORD,
     HISTORY_START, HISTORY_DAYS_INCREMENTAL, ENERGY_PRICE_EUR_PER_KWH,
 )
 
@@ -30,7 +30,8 @@ _GROUPES = [
 class VialisCoordinator(DataUpdateCoordinator):
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
-        super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=UPDATE_INTERVAL)
+        hours = int(entry.options.get(CONF_UPDATE_HOURS, DEFAULT_UPDATE_HOURS))
+        super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=timedelta(hours=hours))
         self._username = entry.data[CONF_USERNAME]
         self._password = entry.data[CONF_PASSWORD]
         self.token: str | None = None
@@ -49,69 +50,67 @@ class VialisCoordinator(DataUpdateCoordinator):
     def _is_token_valid(self) -> bool:
         return bool(self.token and self.token_expiry and datetime.now() < self.token_expiry)
 
-    async def _authenticate(self) -> None:
+    async def _authenticate(self, session: aiohttp.ClientSession) -> None:
         code_challenge = (
             base64.urlsafe_b64encode(hashlib.sha256(CODE_VERIFIER.encode()).digest())
             .decode().rstrip("=")
         )
-        async with aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True)) as session:
-            resp1 = await session.post(
-                f"{BASE_URL}/auth/externe/authentification",
-                data={"username": self._username, "password": self._password, "client_id": CLIENT_ID},
-            )
-            resp1.raise_for_status()
-            body1 = await resp1.json(content_type=None)
-            if body1.get("code") != "0":
-                raise UpdateFailed(f"Vialis auth step 1 failed: {body1}")
+        resp1 = await session.post(
+            f"{BASE_URL}/auth/externe/authentification",
+            data={"username": self._username, "password": self._password, "client_id": CLIENT_ID},
+        )
+        resp1.raise_for_status()
+        body1 = await resp1.json(content_type=None)
+        if body1.get("code") != "0":
+            raise UpdateFailed(f"Vialis auth step 1 failed: {body1}")
 
-            resp2 = await session.get(
-                f"{BASE_URL}/auth/authorize-internet",
-                params={"redirect_uri": REDIRECT_URI, "response_type": "code",
-                        "code_challenge": code_challenge, "code_challenge_method": "S256",
-                        "client_id": CLIENT_ID},
-                allow_redirects=False,
-            )
-            location = resp2.headers.get("Location", "")
-            codes = parse_qs(urlparse(location).query).get("code")
-            if not codes:
-                raise UpdateFailed(f"Vialis auth step 2: no code in Location={location!r}")
-            auth_code = codes[0]
+        resp2 = await session.get(
+            f"{BASE_URL}/auth/authorize-internet",
+            params={"redirect_uri": REDIRECT_URI, "response_type": "code",
+                    "code_challenge": code_challenge, "code_challenge_method": "S256",
+                    "client_id": CLIENT_ID},
+            allow_redirects=False,
+        )
+        location = resp2.headers.get("Location", "")
+        codes = parse_qs(urlparse(location).query).get("code")
+        if not codes:
+            raise UpdateFailed(f"Vialis auth step 2: no code in Location={location!r}")
+        auth_code = codes[0]
 
-            resp3 = await session.post(
-                f"{BASE_URL}/auth/tokenUtilisateurInternet",
-                data={"client_id": CLIENT_ID, "code": auth_code, "redirect_uri": REDIRECT_URI,
-                      "grant_type": "authorization_code", "code_verifier": CODE_VERIFIER},
-            )
-            resp3.raise_for_status()
-            token_body = await resp3.json(content_type=None)
-            access_token = token_body.get("access_token")
-            if not access_token:
-                raise UpdateFailed(f"Vialis auth step 3: no access_token: {token_body}")
-            self.token = access_token
-            self.token_expiry = datetime.now() + timedelta(seconds=int(token_body.get("expires_in", 3600)) - 60)
-            _LOGGER.debug("Vialis auth OK, expires %s", self.token_expiry)
+        resp3 = await session.post(
+            f"{BASE_URL}/auth/tokenUtilisateurInternet",
+            data={"client_id": CLIENT_ID, "code": auth_code, "redirect_uri": REDIRECT_URI,
+                  "grant_type": "authorization_code", "code_verifier": CODE_VERIFIER},
+        )
+        resp3.raise_for_status()
+        token_body = await resp3.json(content_type=None)
+        access_token = token_body.get("access_token")
+        if not access_token:
+            raise UpdateFailed(f"Vialis auth step 3: no access_token: {token_body}")
+        self.token = access_token
+        self.token_expiry = datetime.now() + timedelta(seconds=int(token_body.get("expires_in", 3600)) - 60)
+        _LOGGER.debug("Vialis auth OK, expires %s", self.token_expiry)
 
-    async def _ensure_authenticated(self) -> None:
+    async def _ensure_authenticated(self, session: aiohttp.ClientSession) -> None:
         if not self._is_token_valid():
-            await self._authenticate()
+            await self._authenticate(session)
 
     # ------------------------------------------------------------------ API
 
-    async def _fetch_pasc_id(self) -> str:
-        async with aiohttp.ClientSession() as session:
-            resp = await session.get(
-                f"{BASE_URL}/rest/produits/contrats",
-                headers={"Authorization": f"Bearer {self.token}"},
-            )
-            resp.raise_for_status()
-            contracts = await resp.json(content_type=None)
+    async def _fetch_pasc_id(self, session: aiohttp.ClientSession) -> str:
+        resp = await session.get(
+            f"{BASE_URL}/rest/produits/contrats",
+            headers={"Authorization": f"Bearer {self.token}"},
+        )
+        resp.raise_for_status()
+        contracts = await resp.json(content_type=None)
         for c in contracts:
             pid = (c.get("pointAccesServicesClient") or {}).get("id")
             if pid:
                 return str(pid)
         raise UpdateFailed("Vialis: no PASC id found in contracts")
 
-    async def _fetch_historique(self, date_from: str) -> dict:
+    async def _fetch_historique(self, session: aiohttp.ClientSession, date_from: str) -> dict:
         now = datetime.now()
         body = {
             "typeObjet": "DonneesHistoriqueMesureRepresentation",
@@ -120,14 +119,13 @@ class VialisCoordinator(DataUpdateCoordinator):
             "pointAccesServicesClient": {"typeObjet": "produit.PointAccesServicesClient", "id": self.pasc_id},
             "groupesDeGrandeurs": _GROUPES,
         }
-        async with aiohttp.ClientSession() as session:
-            resp = await session.post(
-                f"{BASE_URL}/rest/interfaces/aelgrd/historiqueDeMesure",
-                json=body,
-                headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"},
-            )
-            resp.raise_for_status()
-            return await resp.json(content_type=None)
+        resp = await session.post(
+            f"{BASE_URL}/rest/interfaces/aelgrd/historiqueDeMesure",
+            json=body,
+            headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"},
+        )
+        resp.raise_for_status()
+        return await resp.json(content_type=None)
 
     # ------------------------------------------------------------------ parsing
 
@@ -484,9 +482,9 @@ class VialisCoordinator(DataUpdateCoordinator):
 
     # ------------------------------------------------------------------ main update
 
-    async def _do_update(self) -> dict:
+    async def _do_update(self, session: aiohttp.ClientSession) -> dict:
         if self.pasc_id is None:
-            self.pasc_id = await self._fetch_pasc_id()
+            self.pasc_id = await self._fetch_pasc_id(session)
 
         if not self._history_loaded:
             date_from = HISTORY_START
@@ -499,7 +497,7 @@ class VialisCoordinator(DataUpdateCoordinator):
             date_from = since_dt.strftime("%Y-%m-%dT00:00:00.000+02:00")
             since = since_dt
 
-        data = await self._fetch_historique(date_from)
+        data = await self._fetch_historique(session, date_from)
         tariff_daily, tariff_meta, pmax_entries, courbe_entries = self._parse_raw(data)
         self._merge(tariff_daily, tariff_meta, courbe_entries)
         self._import_statistics(since=since)
@@ -515,19 +513,24 @@ class VialisCoordinator(DataUpdateCoordinator):
         return self._compute_current(pmax_entries, courbe_entries)
 
     async def _async_update_data(self) -> dict:
-        try:
-            await self._ensure_authenticated()
-            return await self._do_update()
-        except UpdateFailed:
-            raise
-        except aiohttp.ClientResponseError as err:
-            if err.status == 401:
-                self.token = None
-                try:
-                    await self._authenticate()
-                    return await self._do_update()
-                except Exception as retry_err:
-                    raise UpdateFailed(f"Vialis re-auth failed: {retry_err}") from retry_err
-            raise UpdateFailed(f"Vialis HTTP {err.status}: {err}") from err
-        except Exception as err:
-            raise UpdateFailed(f"Vialis error: {err}") from err
+        # One session for the full update cycle (auth + pasc_id + historique).
+        # The cookie jar must be unsafe so the PKCE OAuth cookies survive across steps.
+        async with aiohttp.ClientSession(
+            cookie_jar=aiohttp.CookieJar(unsafe=True)
+        ) as session:
+            try:
+                await self._ensure_authenticated(session)
+                return await self._do_update(session)
+            except UpdateFailed:
+                raise
+            except aiohttp.ClientResponseError as err:
+                if err.status == 401:
+                    self.token = None
+                    try:
+                        await self._authenticate(session)
+                        return await self._do_update(session)
+                    except Exception as retry_err:
+                        raise UpdateFailed(f"Vialis re-auth failed: {retry_err}") from retry_err
+                raise UpdateFailed(f"Vialis HTTP {err.status}: {err}") from err
+            except Exception as err:
+                raise UpdateFailed(f"Vialis error: {err}") from err

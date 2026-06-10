@@ -1,5 +1,3 @@
-from datetime import timedelta
-
 DOMAIN = "vialis"
 BASE_URL = "https://aelgrd.vialis.net/application"
 # Public PKCE OAuth client ID embedded in the Vialis web portal (not a user secret)
@@ -8,7 +6,11 @@ REDIRECT_URI = "https://aelgrd.vialis.net/autorisation-callback.html"
 CODE_VERIFIER = "3"
 CONF_USERNAME = "username"
 CONF_PASSWORD = "password"
-UPDATE_INTERVAL = timedelta(minutes=30)
+# Poll interval — configurable via the integration's options flow
+CONF_UPDATE_HOURS = "update_hours"
+DEFAULT_UPDATE_HOURS = 6   # 4×/day; data is daily-granularity, polling faster is wasteful
+MIN_UPDATE_HOURS = 1
+MAX_UPDATE_HOURS = 24
 # Fixed anchor date for full-history import (before any French Linky rollout).
 # Using a fixed date (not rolling days_back) ensures cumulative sums never drift
 # across HA restarts — once imported, old entries are always re-imported with
