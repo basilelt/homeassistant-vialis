@@ -1,0 +1,1 @@
+{"config":{"step":{"user":{"title":"Vialis Linky","description":"Enter your Vialis portal credentials","data":{"username":"Email","password":"Password"}}},"error":{"invalid_auth":"Invalid credentials"},"abort":{"already_configured":"Already configured"}}}
