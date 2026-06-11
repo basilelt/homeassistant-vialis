@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Tooling / editors
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.idea/
+.vscode/
