@@ -15,6 +15,7 @@ from .const import (
     CONF_UPDATE_HOURS, DEFAULT_UPDATE_HOURS, CONF_USERNAME, CONF_PASSWORD,
     HISTORY_START, HISTORY_DAYS_INCREMENTAL, ENERGY_PRICE_EUR_PER_KWH,
 )
+from ._stats import anchored
 
 _LOGGER = logging.getLogger(__name__)
 _TZ = zoneinfo.ZoneInfo("Europe/Paris")
@@ -249,11 +250,47 @@ class VialisCoordinator(DataUpdateCoordinator):
 
     # ------------------------------------------------------------------ statistics
 
-    def _import_statistics(self, since: datetime | None = None) -> None:
+    @staticmethod
+    def _epoch_to_dt(ts) -> datetime | None:
+        if ts is None:
+            return None
+        ts = float(ts)
+        if ts > 1e12:  # some recorder versions hand back milliseconds
+            ts /= 1000.0
+        return datetime.fromtimestamp(ts, tz=_TZ)
+
+    async def _fetch_last_sums(self, stat_ids: list[str]) -> dict | None:
+        """Return {stat_id: (last_start_dt, last_sum)} from the recorder.
+
+        Returns None on failure so the caller can skip the import rather than
+        re-importing from a zero baseline and recreating a negative seam.
         """
-        Import historical energy + power statistics into HA recorder.
-        since: if set, only send entries >= this date (for incremental updates).
-               The cumulative sum is still computed from the full stored history.
+        try:
+            from homeassistant.components.recorder import get_instance
+            from homeassistant.components.recorder.statistics import get_last_statistics
+        except Exception:
+            return None
+
+        def _query() -> dict:
+            out: dict[str, tuple] = {}
+            for sid in stat_ids:
+                rows = (get_last_statistics(self.hass, 1, sid, True, {"sum"}) or {}).get(sid)
+                if rows:
+                    out[sid] = (self._epoch_to_dt(rows[0].get("start")), rows[0].get("sum") or 0.0)
+            return out
+
+        try:
+            return await get_instance(self.hass).async_add_executor_job(_query)
+        except Exception as e:
+            _LOGGER.warning("Vialis: could not read recorder baselines: %s", e)
+            return None
+
+    def _import_statistics(self, baselines: dict, since: datetime | None = None) -> None:
+        """
+        Import energy + power statistics into the HA recorder.
+        baselines: {stat_id: (last_start_dt, last_sum)} — cumulative series are
+                   anchored to these so sums only ever grow (no negative bars).
+        since: limits which load-curve mean buckets are recomputed (perf only).
         """
         try:
             from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
@@ -263,30 +300,31 @@ class VialisCoordinator(DataUpdateCoordinator):
             _LOGGER.debug("Recorder not available, skipping statistics import")
             return
 
-        self._import_energy_statistics(StatisticData, StatisticMetaData, StatisticMeanType, async_add_external_statistics, since)
-        self._import_courbe_energy_statistics(StatisticData, StatisticMetaData, StatisticMeanType, async_add_external_statistics, since)
-        self._import_courbe_cost_statistics(StatisticData, StatisticMetaData, StatisticMeanType, async_add_external_statistics, since)
+        self._import_energy_statistics(StatisticData, StatisticMetaData, StatisticMeanType, async_add_external_statistics, baselines)
+        self._import_courbe_energy_statistics(StatisticData, StatisticMetaData, StatisticMeanType, async_add_external_statistics, baselines)
+        self._import_courbe_cost_statistics(StatisticData, StatisticMetaData, StatisticMeanType, async_add_external_statistics, baselines)
         self._import_courbe_statistics(StatisticData, StatisticMetaData, StatisticMeanType, async_add_external_statistics, since)
 
-    def _import_energy_statistics(self, StatisticData, StatisticMetaData, StatisticMeanType, async_add_external_statistics, since):
+    def _import_energy_statistics(self, StatisticData, StatisticMetaData, StatisticMeanType, async_add_external_statistics, baselines):
         total_by_date: dict[datetime, float] = {}
 
         for mnemo, daily in self._all_daily.items():
             if not daily:
                 continue
             libelle = self._tariff_meta.get(mnemo, mnemo)
-            cumulative = 0.0
-            stats = []
-            for dt in sorted(daily):
-                kwh = daily[dt]
-                cumulative += kwh
+            stat_id = f"{DOMAIN}:energy_{mnemo.lower()}"
+            last_dt, base_sum = baselines.get(stat_id, (None, 0.0))
+            last_key = last_dt.date() if last_dt else None
+            items = []
+            for dt, kwh in daily.items():
                 total_by_date[dt] = total_by_date.get(dt, 0.0) + kwh
-                if since is None or dt >= since:
-                    start = dt.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=_TZ)
-                    stats.append(StatisticData(start=start, state=kwh, sum=cumulative))
+                items.append((dt.date(), kwh, dt))
+            stats = []
+            for dt, kwh, cumulative in anchored(items, last_key, base_sum or 0.0):
+                start = dt.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=_TZ)
+                stats.append(StatisticData(start=start, state=kwh, sum=cumulative))
             if not stats:
                 continue
-            stat_id = f"{DOMAIN}:energy_{mnemo.lower()}"
             try:
                 async_add_external_statistics(
                     self.hass,
@@ -307,16 +345,15 @@ class VialisCoordinator(DataUpdateCoordinator):
         # Total across all tariffs
         if not total_by_date:
             return
-        cumulative = 0.0
+        stat_id = f"{DOMAIN}:energy_total"
+        last_dt, base_sum = baselines.get(stat_id, (None, 0.0))
+        last_key = last_dt.date() if last_dt else None
+        items = [(dt.date(), v, dt) for dt, v in total_by_date.items()]
         stats = []
-        for dt in sorted(total_by_date):
-            kwh = total_by_date[dt]
-            cumulative += kwh
-            if since is None or dt >= since:
-                start = dt.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=_TZ)
-                stats.append(StatisticData(start=start, state=kwh, sum=cumulative))
+        for dt, kwh, cumulative in anchored(items, last_key, base_sum or 0.0):
+            start = dt.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=_TZ)
+            stats.append(StatisticData(start=start, state=kwh, sum=cumulative))
         if stats:
-            stat_id = f"{DOMAIN}:energy_total"
             try:
                 async_add_external_statistics(
                     self.hass,
@@ -334,7 +371,7 @@ class VialisCoordinator(DataUpdateCoordinator):
             except Exception as e:
                 _LOGGER.warning("Vialis stats import failed for %s: %s", stat_id, e)
 
-    def _import_courbe_energy_statistics(self, StatisticData, StatisticMetaData, StatisticMeanType, async_add_external_statistics, since):
+    def _import_courbe_energy_statistics(self, StatisticData, StatisticMetaData, StatisticMeanType, async_add_external_statistics, baselines):
         """Import hourly energy (kWh) from courbe de charge for the energy dashboard.
 
         HA external statistics require top-of-hour timestamps, so we sum both 30-min
@@ -343,28 +380,26 @@ class VialisCoordinator(DataUpdateCoordinator):
         if not self._all_courbe:
             return
 
-        # Accumulate kWh per top-of-hour bucket across ALL history (for correct cumsum)
         hourly_kwh: dict[datetime, float] = {}
         for (dt, heure), watts in self._all_courbe.items():
             try:
                 hour, minute = map(int, heure.split(":"))
-                bucket = datetime(dt.year, dt.month, dt.day, hour, 0, 0)
+                bucket = datetime(dt.year, dt.month, dt.day, hour, 0, 0, tzinfo=_TZ)
             except (ValueError, AttributeError):
                 continue
             hourly_kwh[bucket] = hourly_kwh.get(bucket, 0.0) + watts * 0.5 / 1000
 
-        cumulative = 0.0
-        stats = []
-        for bucket in sorted(hourly_kwh):
-            kwh = hourly_kwh[bucket]
-            cumulative += kwh
-            if since is None or bucket >= since:
-                stats.append(StatisticData(start=bucket.replace(tzinfo=_TZ), state=kwh, sum=cumulative))
+        stat_id = f"{DOMAIN}:energy_courbe"
+        last_dt, base_sum = baselines.get(stat_id, (None, 0.0))
+        items = [(b, v, b) for b, v in hourly_kwh.items()]
+        stats = [
+            StatisticData(start=b, state=kwh, sum=cumulative)
+            for b, kwh, cumulative in anchored(items, last_dt, base_sum or 0.0)
+        ]
 
         if not stats:
             return
 
-        stat_id = f"{DOMAIN}:energy_courbe"
         try:
             async_add_external_statistics(
                 self.hass,
@@ -382,7 +417,7 @@ class VialisCoordinator(DataUpdateCoordinator):
         except Exception as e:
             _LOGGER.warning("Vialis stats import failed for %s: %s", stat_id, e)
 
-    def _import_courbe_cost_statistics(self, StatisticData, StatisticMetaData, StatisticMeanType, async_add_external_statistics, since):
+    def _import_courbe_cost_statistics(self, StatisticData, StatisticMetaData, StatisticMeanType, async_add_external_statistics, baselines):
         """Import cumulative energy cost (EUR) derived from courbe de charge.
 
         The HA Energy dashboard only shows cost for external statistics when
@@ -399,27 +434,22 @@ class VialisCoordinator(DataUpdateCoordinator):
         for (dt, heure), watts in self._all_courbe.items():
             try:
                 hour, minute = map(int, heure.split(":"))
-                bucket = datetime(dt.year, dt.month, dt.day, hour, 0, 0)
+                bucket = datetime(dt.year, dt.month, dt.day, hour, 0, 0, tzinfo=_TZ)
             except (ValueError, AttributeError):
                 continue
             hourly_kwh[bucket] = hourly_kwh.get(bucket, 0.0) + watts * 0.5 / 1000
 
-        cumulative_eur = 0.0
-        stats = []
-        for bucket in sorted(hourly_kwh):
-            eur = hourly_kwh[bucket] * ENERGY_PRICE_EUR_PER_KWH
-            cumulative_eur += eur
-            if since is None or bucket >= since:
-                stats.append(StatisticData(
-                    start=bucket.replace(tzinfo=_TZ),
-                    state=eur,
-                    sum=cumulative_eur,
-                ))
+        stat_id = f"{DOMAIN}:energy_courbe_cost"
+        last_dt, base_sum = baselines.get(stat_id, (None, 0.0))
+        items = [(b, v * ENERGY_PRICE_EUR_PER_KWH, b) for b, v in hourly_kwh.items()]
+        stats = [
+            StatisticData(start=b, state=eur, sum=cumulative_eur)
+            for b, eur, cumulative_eur in anchored(items, last_dt, base_sum or 0.0)
+        ]
 
         if not stats:
             return
 
-        stat_id = f"{DOMAIN}:energy_courbe_cost"
         try:
             async_add_external_statistics(
                 self.hass,
@@ -500,7 +530,14 @@ class VialisCoordinator(DataUpdateCoordinator):
         data = await self._fetch_historique(session, date_from)
         tariff_daily, tariff_meta, pmax_entries, courbe_entries = self._parse_raw(data)
         self._merge(tariff_daily, tariff_meta, courbe_entries)
-        self._import_statistics(since=since)
+
+        stat_ids = [f"{DOMAIN}:energy_{m.lower()}" for m in self._all_daily]
+        stat_ids += [f"{DOMAIN}:energy_total", f"{DOMAIN}:energy_courbe", f"{DOMAIN}:energy_courbe_cost"]
+        baselines = await self._fetch_last_sums(stat_ids)
+        if baselines is None:
+            _LOGGER.warning("Vialis: skipping stats import this cycle (no recorder baseline)")
+        else:
+            self._import_statistics(baselines, since=since)
 
         if not self._history_loaded:
             self._history_loaded = True
