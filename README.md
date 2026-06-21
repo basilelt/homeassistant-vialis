@@ -82,6 +82,7 @@ After the first data load (may take a minute):
 - **`invalid_auth`** — verify credentials at [aelgrd.vialis.net](https://aelgrd.vialis.net)
 - **Statistics not appearing** — HA Recorder must be enabled; wait one full poll cycle
 - **Wrong cost figures** — update `ENERGY_PRICE_EUR_PER_KWH` in `const.py` to match your contract rate
+- **Negative bar on the Energy Dashboard** — cumulative statistics are anchored to the recorder's last stored `sum` (`coordinator._fetch_last_sums`): the integration only ever appends new buckets, never recomputes history from zero. This is required because the portal API only returns a recent window per call, so a restart that recomputed from zero would strand the older rows at a higher `sum` and render the gap as one large negative bar. If you see a pre-existing negative bar from before this fix, repair it with **Developer Tools → Statistics → fix** (or shift every post-seam `sum` up by the pre-seam value).
 
 ---
 
