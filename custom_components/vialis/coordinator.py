@@ -235,17 +235,22 @@ class VialisCoordinator(DataUpdateCoordinator):
         pmax_latest = max(pmax_entries, key=lambda x: x["dt"]) if pmax_entries else None
         courbe_latest = max(courbe_entries, key=lambda x: (x["dt"], x["heure"])) if courbe_entries else None
 
+        # Vialis intermittently returns a 200 with empty puissancesMaximales/courbe arrays;
+        # hold the last known value instead of flapping the sensor to unknown. pmax_date/heure
+        # (and current_power_date) stay attached so staleness is visible.
+        prev = self.data or {}
+
         return {
             "latest_date": latest_date_str,
             "latest_kwh": sum(t["latest_kwh"] for t in tariffs.values()),
             "monthly_kwh": sum(t["monthly_kwh"] for t in tariffs.values()),
             "tariffs": tariffs,
-            "pmax_kva": pmax_latest["kva"] if pmax_latest else None,
-            "pmax_date": pmax_latest["date"] if pmax_latest else None,
-            "pmax_heure": pmax_latest["heure"] if pmax_latest else None,
-            "current_power_w": courbe_latest["watts"] if courbe_latest else None,
-            "current_power_date": courbe_latest["date"] if courbe_latest else None,
-            "current_power_heure": courbe_latest["heure"] if courbe_latest else None,
+            "pmax_kva": pmax_latest["kva"] if pmax_latest else prev.get("pmax_kva"),
+            "pmax_date": pmax_latest["date"] if pmax_latest else prev.get("pmax_date"),
+            "pmax_heure": pmax_latest["heure"] if pmax_latest else prev.get("pmax_heure"),
+            "current_power_w": courbe_latest["watts"] if courbe_latest else prev.get("current_power_w"),
+            "current_power_date": courbe_latest["date"] if courbe_latest else prev.get("current_power_date"),
+            "current_power_heure": courbe_latest["heure"] if courbe_latest else prev.get("current_power_heure"),
         }
 
     # ------------------------------------------------------------------ statistics
